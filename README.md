@@ -86,6 +86,3 @@ This script automatically exports optimized JSON weights for the mobile inferenc
    ```bash
    npx eas build --platform android --profile preview
    ```
-
----
-Created as part of the HandShake Research Project.
