@@ -4,9 +4,17 @@ import modelWeights from '../../assets/model/fsl_model_weights.json';
 
 let initialized = false;
 
-// Simple Matrix Multiplication and Activation for Inference
+// --- ACTIVATION FUNCTIONS ---
 function relu(x) {
   return x.map(v => Math.max(0, v));
+}
+
+function sigmoid(x) {
+  return x.map(v => 1 / (1 + Math.exp(-v)));
+}
+
+function tanh(x) {
+  return x.map(v => Math.tanh(v));
 }
 
 function softmax(x) {
@@ -16,32 +24,91 @@ function softmax(x) {
   return exps.map(v => v / sumExps);
 }
 
+// --- LAYER IMPLEMENTATIONS ---
+
 /**
- * Dense Layer Implementation: Performs Wx + b
- * @param {Array} input - Input vector
- * @param {Array} weights - 2D Weight matrix [input_size][output_size]
- * @param {Array} biases - Bias vector
- * @param {string} activation - 'relu' or 'softmax'
+ * performs Wx + b
  */
 function dense(input, weights, biases, activation = 'relu') {
-  const output = new Array(biases.length).fill(0);
-  for (let j = 0; j < biases.length; j++) {
+  const outputSize = biases.length;
+  const output = new Array(outputSize).fill(0);
+  for (let j = 0; j < outputSize; j++) {
     let sum = biases[j];
     for (let i = 0; i < input.length; i++) {
       sum += input[i] * weights[i][j];
     }
     output[j] = sum;
   }
-  return activation === 'relu' ? relu(output) : softmax(output);
+  if (activation === 'relu') return relu(output);
+  if (activation === 'softmax') return softmax(output);
+  return output;
 }
 
 /**
- * initInference: Prepares the inference engine by fixing label encodings.
+ * gruStep: Performs a single GRU time-step calculation
+ * Formula follows Keras default (reset_after=True)
  */
+function gruStep(x, h_prev, kernel, recurrent_kernel, bias) {
+  const units = h_prev.length;
+  
+  // Keras GRU bias is split into [input_bias, recurrent_bias]
+  const b_i = bias[0];
+  const b_h = bias[1];
+
+  // Gates are ordered [z, r, h] (Update, Reset, New)
+  const z_idx = 0;
+  const r_idx = units;
+  const h_idx = 2 * units;
+
+  // 1. Update and Reset Gates
+  const z = new Array(units);
+  const r = new Array(units);
+
+  for (let j = 0; j < units; j++) {
+    let sum_z = b_i[z_idx + j] + b_h[z_idx + j];
+    let sum_r = b_i[r_idx + j] + b_h[r_idx + j];
+    
+    for (let i = 0; i < x.length; i++) {
+      sum_z += x[i] * kernel[i][z_idx + j];
+      sum_r += x[i] * kernel[i][r_idx + j];
+    }
+    for (let i = 0; i < units; i++) {
+      sum_z += h_prev[i] * recurrent_kernel[i][z_idx + j];
+      sum_r += h_prev[i] * recurrent_kernel[i][r_idx + j];
+    }
+    z[j] = 1 / (1 + Math.exp(-sum_z)); // sigmoid
+    r[j] = 1 / (1 + Math.exp(-sum_r)); // sigmoid
+  }
+
+  // 2. Candidate Hidden State (New)
+  const h_hat = new Array(units);
+  for (let j = 0; j < units; j++) {
+    let sum_x = b_i[h_idx + j];
+    for (let i = 0; i < x.length; i++) {
+      sum_x += x[i] * kernel[i][h_idx + j];
+    }
+    
+    let sum_h = b_h[h_idx + j];
+    for (let i = 0; i < units; i++) {
+      sum_h += h_prev[i] * recurrent_kernel[i][h_idx + j];
+    }
+    
+    h_hat[j] = Math.tanh(sum_x + r[j] * sum_h);
+  }
+
+  // 3. Final Hidden State for this step
+  const h_next = new Array(units);
+  for (let j = 0; j < units; j++) {
+    h_next[j] = z[j] * h_prev[j] + (1 - z[j]) * h_hat[j];
+  }
+
+  return h_next;
+}
+
 export async function initInference() {
   if (initialized) return;
   try {
-    console.log('Inference engine initializing...');
+    console.log('GRU Inference Engine Initialized');
     initialized = true;
   } catch (error) {
     console.error('Failed to initialize inference:', error);
@@ -49,47 +116,51 @@ export async function initInference() {
 }
 
 /**
- * predictSign: Main inference entry point.
- * Performs a forward pass through the 4-layer neural network using weights from JSON.
- * @param {Array} landmarks - Raw MediaPipe landmarks (21 points with x,y,z)
+ * predictSign: Performs sequential inference using GRU
+ * @param {Array} sequence - Buffer of normalized landmarks [[x1,y1...], [x2,y2...]]
  */
-export async function predictSign(landmarks) {
-  if (!initialized || !landmarks || !modelWeights) return null;
+export async function predictSign(sequence) {
+  if (!initialized || !sequence || sequence.length === 0 || !modelWeights) return null;
 
   try {
-    // 1. Normalize landmarks (centered at wrist, scaled by palm size)
-    const normalized = normalizeLandmarks(landmarks);
-    if (!normalized) return null;
-
-    // --- FORWARD PASS ---
-    // Layer 1: Input (63) -> Dense (256) -> ReLU
-    const layer1 = dense(normalized, modelWeights.dense.weights, modelWeights.dense.biases, 'relu');
+    // Find the GRU layer weights (usually named 'gru' or 'gru_1')
+    const gruLayerName = Object.keys(modelWeights).find(name => name.includes('gru'));
+    const gru = gruLayerName ? modelWeights[gruLayerName] : null;
     
-    // Layer 2: Dense (256) -> Dense (128) -> ReLU
-    const layer2 = dense(layer1, modelWeights.dense_1.weights, modelWeights.dense_1.biases, 'relu');
+    if (!gru) {
+      console.warn('GRU weights not found. Please run the training script to generate new weights.');
+      return null;
+    }
     
-    // Layer 3: Dense (128) -> Dense (64) -> ReLU
-    const layer3 = dense(layer2, modelWeights.dense_2.weights, modelWeights.dense_2.biases, 'relu');
+    // Initial hidden state (zeros)
+    let h = new Array(gru.recurrent_kernel.length).fill(0);
 
-    // Layer 4: Dense (64) -> Output (classes) -> Softmax
-    const probabilities = dense(layer3, modelWeights.dense_3.weights, modelWeights.dense_3.biases, 'softmax');
+    // --- GRU FORWARD PASS (Process entire sequence) ---
+    for (const x of sequence) {
+      h = gruStep(x, h, gru.kernel, gru.recurrent_kernel, gru.bias);
+    }
 
-    // 2. Identify class with highest probability
+    // --- DENSE LAYERS (Post-GRU) ---
+    // Layer 2: Dense (32) -> ReLU
+    const dense1Name = Object.keys(modelWeights).find(name => name.includes('dense') && !name.includes('dense_1'));
+    const layer2 = dense(h, modelWeights[dense1Name].weights, modelWeights[dense1Name].biases, 'relu');
+    
+    // Layer 3: Output -> Softmax
+    const dense2Name = Object.keys(modelWeights).find(name => name.includes('dense_1'));
+    const probabilities = dense(layer2, modelWeights[dense2Name].weights, modelWeights[dense2Name].biases, 'softmax');
+
     const maxProb = Math.max(...probabilities);
     const classIdx = probabilities.indexOf(maxProb);
 
     let finalLabel = labelsMapping[classIdx] || 'Unknown';
-    // Fix character encoding for 'Ñ'
-    if (finalLabel === 'Ã‘' || finalLabel.includes('Ã')) {
-      finalLabel = 'Ñ';
-    }
+    if (finalLabel === 'Ã‘' || finalLabel.includes('Ã')) finalLabel = 'Ñ';
 
     return {
       label: finalLabel,
       confidence: maxProb
     };
   } catch (error) {
-    console.error('Prediction error:', error);
+    console.error('GRU Prediction error:', error);
     return null;
   }
 }

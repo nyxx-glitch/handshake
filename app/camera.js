@@ -5,10 +5,12 @@ import HandTracker from '../src/inference/HandTrackerWebView';
 import { router } from 'expo-router';
 import * as Clipboard from 'expo-clipboard';
 import Constants from 'expo-constants';
-import { SIGN_LABELS } from '../constants/labels';
+import { SIGN_LABELS, WORD_LABELS, CONTEXT_RULES } from '../constants/labels';
 import { createPredictionSmoother } from '../src/inference/predictionSmoother';
 import { normalizeLandmarks } from '../src/inference/normalization';
 import { initInference, predictSign } from '../src/inference/inferenceAdapter';
+
+const SEQUENCE_LENGTH = 10; // Reduced from 20 to 10 for much faster real-time feel (0.3s lag)
 
 const CameraScreen = () => {
   const [permission, requestPermission] = useCameraPermissions();
@@ -17,12 +19,42 @@ const CameraScreen = () => {
   // detected: Holds the current smoothed prediction (label, confidence, stability)
   const [detected, setDetected] = useState({ label: 'Idle', confidence: 0, stable: false });
   
+  // landmarkBuffer: Stores the last SEQUENCE_LENGTH frames of normalized landmarks
+  const landmarkBuffer = useRef([]);
+  const isInferring = useRef(false); // Lock to prevent inference from blocking recording
+
   // --- DATA COLLECTION (TRAINING MODE) ---
   const [isRecording, setIsRecording] = useState(false);
+  const isRecordingRef = useRef(false); // Atomic check for the message handler
   const [selectedLabel, setSelectedLabel] = useState('A');
-  const [sessionData, setSessionData] = useState([]);
+  const selectedLabelRef = useRef('A'); // Atomic check for the message handler
+  const recordingDataRef = useRef([]); // High-performance storage for landmark frames
+  const [recordingCount, setRecordingCount] = useState(0); // For UI counter display
   const [showTrainingControls, setShowTrainingControls] = useState(false);
   const [cameraFacing, setCameraFacing] = useState('user'); // 'user' (front) or 'environment' (back)
+
+  // Sync refs with state
+  useEffect(() => {
+    isRecordingRef.current = isRecording;
+  }, [isRecording]);
+
+  useEffect(() => {
+    selectedLabelRef.current = selectedLabel;
+  }, [selectedLabel]);
+
+  // Decouple UI Counter from high-frequency recording loop
+  // This ensures the UI increments smoothly without blocking the bridge
+  useEffect(() => {
+    let interval;
+    if (isRecording) {
+      interval = setInterval(() => {
+        setRecordingCount(recordingDataRef.current.length);
+      }, 50); // Update UI every 50ms (20fps UI)
+    } else {
+      setRecordingCount(recordingDataRef.current.length);
+    }
+    return () => clearInterval(interval);
+  }, [isRecording]);
 
   // --- WORD BUILDER LOGIC ---
   // signTranslation: The word/sentence automatically built via handsigns (overlay)
@@ -30,11 +62,11 @@ const CameraScreen = () => {
   // constructedWord: The text typed manually or selected from phrases (input box)
   const [constructedWord, setConstructedWord] = useState(''); 
   
-  // Timers and tracking for gesture stability
-  const [holdTimer, setHoldTimer] = useState(0);
-  const [lastLabel, setLastLabel] = useState('Idle');
-  const [lastAddedLabel, setLastAddedLabel] = useState(null);
-  const [lastAddedTime, setLastAddedTime] = useState(0);
+  // --- ATOMIC LOGIC REFS (Prevents race conditions & batching) ---
+  const lastAcceptedGesture = useRef('Idle');
+  const lastAcceptedTime = useRef(0);
+  const consecutiveFrames = useRef(0);
+  const currentTrackingLabel = useRef('Idle');
   
   // Tracks the last time any valid sign was detected for the 5s auto-clear feature
   const [lastDetectionTime, setLastDetectionTime] = useState(Date.now());
@@ -60,12 +92,73 @@ const CameraScreen = () => {
     idleLabel: 'Idle',
   }), []);
 
-  /**
-   * exportData: Sends recorded landmark data to the local server or clipboard
-   * Used during the data collection phase for training the AI.
-   */
   const exportData = async () => {
-    // ... (rest of the function)
+    const dataToExport = recordingDataRef.current;
+    console.log('Exporting data...', dataToExport.length, 'frames');
+    
+    if (dataToExport.length === 0) {
+      Alert.alert('No Data', 'No data recorded yet!');
+      return;
+    }
+
+    const jsonString = JSON.stringify(dataToExport);
+
+    // Try to send to local server first
+    try {
+      const debuggerHost = Constants.expoConfig?.debuggerHost || Constants.manifest2?.extra?.expoGo?.debuggerHost || Constants.manifest?.debuggerHost;
+      const host = debuggerHost ? debuggerHost.split(':')[0] : null;
+      
+      if (host) {
+        const serverUrl = `http://${host}:3000/save-data`;
+        console.log('Attempting to save to server:', serverUrl);
+
+        const response = await fetch(serverUrl, {
+          method: 'POST',
+          headers: { 'Content-Type': 'application/json' },
+          body: JSON.stringify({
+            label: selectedLabel,
+            data: dataToExport,
+          }),
+        }).catch(err => {
+          console.log('Fetch error (server likely offline):', err.message);
+          return null;
+        });
+
+        if (response && response.ok) {
+          const result = await response.json();
+          Alert.alert(
+            'Saved Automatically!',
+            `Data saved to data/${result.filename} on your computer.`,
+            [{ text: 'Great!' }]
+          );
+          return;
+        }
+      } else {
+        console.log('Could not determine host IP for auto-save');
+      }
+    } catch (error) {
+      console.log('Local server auto-save failed:', error.message);
+    }
+
+    
+    try {
+      console.log('Falling back to clipboard export...');
+      await Clipboard.setStringAsync(jsonString);
+      Alert.alert(
+        'Copied to Clipboard',
+        `${dataToExport.length} frames copied.\n\nServer was unreachable, so please paste this into a .json file in your data/ folder manually.`,
+        [{ text: 'Got it!' }]
+      );
+    } catch (error) {
+      console.error('Clipboard error:', error);
+      Alert.alert('Error', 'Failed to export data to server or clipboard.');
+    }
+  };
+
+  const clearSession = () => {
+    recordingDataRef.current = [];
+    setRecordingCount(0);
+    Alert.alert('Cleared', 'Session data cleared.');
   };
 
   /**
@@ -74,90 +167,129 @@ const CameraScreen = () => {
    */
   const handleHandDetected = useCallback(async (landmarks) => {
     if (landmarks && landmarks.length === 21) {
-      // Normalize landmarks to ensure scale/position invariance
       const normalized = normalizeLandmarks(landmarks);
+      const now = Date.now();
 
-      // Record data if in training mode
-      if (isRecording) {
-        setSessionData(prev => [...prev, {
-          label: selectedLabel,
+      // --- 1. RESET IDLE TIMER IMMEDIATELY ---
+      // This prevents the word from clearing while the system is "thinking"
+      setLastDetectionTime(now);
+
+      // --- 2. PRIORITY: RECORDING (Synchronous Atomic Storage) ---
+      // This MUST be the first operation to ensure research-level precision
+      if (isRecordingRef.current) {
+        recordingDataRef.current.push({
+          label: selectedLabelRef.current,
           landmarks: normalized,
-          timestamp: Date.now()
-        }]);
+          timestamp: now
+        });
+        return; // EXIT EARLY: Disable AI brain while recording for 100% precision
       }
 
-      // 1. Run inference using the manual 4-layer NN in inferenceAdapter.js
-      const prediction = await predictSign(landmarks);
-      
-      const raw = {
-        label: prediction ? prediction.label : 'Idle',
-        confidence: prediction ? prediction.confidence : 0,
-        landmarks: normalized
-      };
-      
-      // 2. Smooth the prediction to prevent rapid label jumping
-      const smoothed = smoother.pushPrediction(raw);
-      setDetected(smoothed);
-
-      // Update detection time for the 5-second auto-clear logic
-      if (smoothed.label !== 'Idle') {
-        setLastDetectionTime(Date.now());
+      // --- 2. SECONDARY: INFERENCE (Only runs when NOT recording) ---
+      // Maintain the sliding window buffer for GRU
+      landmarkBuffer.current.push(normalized);
+      if (landmarkBuffer.current.length > SEQUENCE_LENGTH) {
+        landmarkBuffer.current.shift();
       }
 
-      // --- WORD BUILDER MECHANIC ---
-      const currentLabel = smoothed.label;
-      if (currentLabel !== 'Idle' && smoothed.stable) {
-        // COOLDOWN LOGIC: Prevent spamming dynamic signs (J, Z, Ñ)
-        const isDynamicSign = ['J', 'Z', 'Ñ'].includes(currentLabel);
-        if (isDynamicSign && currentLabel === lastAddedLabel) {
-          const now = Date.now();
-          const cooldownTime = ['Z', 'Ñ'].includes(currentLabel) ? 2000 : 1000;
-          if (now - lastAddedTime < cooldownTime) {
-            setHoldTimer(0);
-            return;
-          }
-        }
+      // Only run if we aren't already calculating and have a full buffer
+      if (!isInferring.current && landmarkBuffer.current.length === SEQUENCE_LENGTH) {
+        isInferring.current = true;
+        
+        try {
+          const prediction = await predictSign(landmarkBuffer.current);
+          
+          const raw = {
+            label: prediction ? prediction.label : 'Idle',
+            confidence: prediction ? prediction.confidence : 0,
+            landmarks: normalized
+          };
+          
+          // Smooth the prediction to prevent rapid label jumping
+          const smoothed = smoother.pushPrediction(raw);
+          setDetected(smoothed);
 
-        // STABILITY TIMER: Require holding a sign for ~0.8s before adding it
-        if (currentLabel === lastLabel) {
-          setHoldTimer(prev => {
-            const nextValue = prev + 1;
-            const threshold = isDynamicSign ? 2 : 12; // Dynamic signs are instant (2 frames)
+          // --- WORD BUILDER MECHANIC (Instant Real-Time Logic) ---
+          const currentLabel = smoothed.label;
+          if (currentLabel !== 'Idle' && smoothed.stable) {
+            const isSameAsLast = currentLabel === lastAcceptedGesture.current;
+            const nowTime = Date.now();
+            const cooldownActive = isSameAsLast && (nowTime - lastAcceptedTime.current < 2000);
 
-            if (nextValue >= threshold) {
-              console.log('Building word with:', currentLabel);
-              setSignTranslation(prev => {
-                const newText = prev + currentLabel;
-                // Maximum 24 characters limit in Word Builder
-                if (newText.length > 24) {
-                  return prev; 
+            if (!cooldownActive) {
+              if (currentLabel === currentTrackingLabel.current) {
+                consecutiveFrames.current += 1;
+                
+                const threshold = isSameAsLast ? 3 : 1; 
+                
+                if (consecutiveFrames.current >= threshold) {
+                  setSignTranslation(prev => {
+                    let finalLabel = currentLabel;
+                    const isWord = WORD_LABELS.includes(currentLabel);
+                    let newText = prev;
+                    
+                    if (!isWord && CONTEXT_RULES.AMBIGUOUS_MAP[currentLabel]) {
+                      const trimmedPrev = newText.trim();
+                      const words = trimmedPrev.split(' ');
+                      const lastWord = words[words.length - 1];
+                      
+                      const isNumberContext = CONTEXT_RULES.NUMBER_TRIGGERS.includes(lastWord) || 
+                                             /^\d+$/.test(lastWord);
+
+                      if (isNumberContext) {
+                        finalLabel = CONTEXT_RULES.AMBIGUOUS_MAP[currentLabel];
+                      }
+                    }
+
+                    if (isWord) {
+                      if (newText.length > 0 && !newText.endsWith(' ')) {
+                        newText += ' ';
+                      }
+                      newText += finalLabel + ' ';
+                    } else {
+                      newText += finalLabel;
+                    }
+                    
+                    newText = newText.replace(/\s+/g, ' ');
+                    
+                    return newText.length > 24 ? prev : newText;
+                  });
+                  
+                  lastAcceptedGesture.current = currentLabel;
+                  lastAcceptedTime.current = nowTime;
+                  consecutiveFrames.current = 0;
+                  currentTrackingLabel.current = 'Idle';
+                  
+                  setLastDetectionTime(nowTime);
                 }
-                return newText;
-              });
-              
-              setLastAddedLabel(currentLabel);
-              setLastAddedTime(Date.now());
-              setLastLabel('Idle'); // Prevent double addition
-              return 0;
+              } else {
+                currentTrackingLabel.current = currentLabel;
+                consecutiveFrames.current = 1; 
+              }
             }
-            return nextValue;
-          });
-        } else {
-          setLastLabel(currentLabel);
-          setHoldTimer(0);
+          } else {
+            consecutiveFrames.current = 0;
+            currentTrackingLabel.current = 'Idle';
+          }
+        } catch (err) {
+          console.error('Inference error:', err);
+        } finally {
+          isInferring.current = false;
         }
-      } else {
-        setHoldTimer(0);
       }
     }
-  }, [isRecording, selectedLabel, smoother, lastLabel, lastAddedLabel, lastAddedTime]);
+  }, [isRecording, selectedLabel, smoother]);
 
   const handleHandLost = useCallback(() => {
     const raw = { label: 'Idle', confidence: 0, landmarks: null };
     const smoothed = smoother.pushPrediction(raw);
     setDetected(smoothed);
-    setHoldTimer(0);
-    setLastLabel('Idle');
+    
+    // Atomic reset on hand loss
+    consecutiveFrames.current = 0;
+    currentTrackingLabel.current = 'Idle';
+    
+    landmarkBuffer.current = []; // Clear buffer when hand is lost
   }, [smoother]);
 
   const handleTrackerReady = useCallback(() => {
@@ -315,7 +447,10 @@ const CameraScreen = () => {
           )}
 
           <TextInput
-            style={styles.textInput}
+            style={[
+              styles.textInput,
+              { fontSize: constructedWord.length > 25 ? 16 : constructedWord.length > 15 ? 20 : 24 }
+            ]}
             value={constructedWord}
             onChangeText={(text) => {
               setConstructedWord(text);
@@ -347,17 +482,21 @@ const CameraScreen = () => {
             
             <TouchableOpacity 
               style={[styles.recordButton, isRecording && styles.recordButtonActive]}
-              onPress={() => setIsRecording(!isRecording)}
+              onPress={() => {
+                if (!isRecording) {
+                }
+                setIsRecording(prev => !prev);
+              }}
             >
               <Text style={styles.recordButtonText}>
-                {isRecording ? `Recording ${selectedLabel}... (${sessionData.length})` : 'Start Training Collection'}
+                {isRecording ? `Recording ${selectedLabel}... (${recordingCount})` : 'Start Training Collection'}
               </Text>
             </TouchableOpacity>
 
-            {sessionData.length > 0 && !isRecording && (
+            {recordingCount > 0 && !isRecording && (
               <View style={styles.sessionActions}>
                 <TouchableOpacity style={styles.exportButton} onPress={exportData}>
-                  <Text style={styles.exportButtonText}>Export JSON ({sessionData.length} frames)</Text>
+                  <Text style={styles.exportButtonText}>Export JSON ({recordingCount} frames)</Text>
                 </TouchableOpacity>
                 <TouchableOpacity style={styles.clearButton} onPress={clearSession}>
                   <Text style={styles.clearButtonText}>Clear</Text>
