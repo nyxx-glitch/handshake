@@ -1,11 +1,11 @@
-# HandShake 👋
+# HandShake 
 ### AI-Powered Filipino Sign Language (FSL) Detection
 
 HandShake is a sophisticated mobile application built with **Expo** and **MediaPipe** that translates Filipino Sign Language (FSL) in real-time. By utilizing a **Spatio-Temporal AI architecture**, the app recognizes both static hand poses and complex moving gestures with high precision.
 
 ---
 
-## 🚀 Key Features
+##  Key Features
 
 - **Sequential Motion Recognition**: Powered by a **Gated Recurrent Unit (GRU)** neural network that understands the "flow" of signs over time.
 - **Real-time FSL Detection**: High-performance hand tracking (21 landmarks) using Google MediaPipe via a custom hybrid bridge.
@@ -16,7 +16,7 @@ HandShake is a sophisticated mobile application built with **Expo** and **MediaP
 
 ---
 
-## 🧠 Technical Architecture
+##  Technical Architecture
 
 ### 1. The Vision Bridge (The Eyes)
 The app utilizes a hidden `WebView` to execute the **MediaPipe Hands** library. This architectural choice bypasses the overhead of native mobile AI wrappers, allowing for consistent **30 FPS landmark extraction** across different hardware.
@@ -36,7 +36,7 @@ The translation-to-text pipeline uses **Atomic State Management** via React Refs
 
 ---
 
-## 🛠️ Tech Stack
+##  Tech Stack
 
 - **Mobile Framework**: Expo (SDK 54), React Native, Expo Router.
 - **AI Core**: Google MediaPipe (Hand Landmarker).
@@ -47,7 +47,7 @@ The translation-to-text pipeline uses **Atomic State Management** via React Refs
 
 ---
 
-## 📂 Project Structure
+##  Project Structure
 
 - `app/`: Expo Router navigation (Main screens: `index.js`, `camera.js`, `reference.js`).
 - `src/inference/`: The core AI engine.
@@ -58,7 +58,7 @@ The translation-to-text pipeline uses **Atomic State Management** via React Refs
 
 ---
 
-## 📊 Development & Training
+##  Development & Training
 
 ### 1. Data Collection
 Long-press the **HandShake Logo** on the camera screen to enter Training Mode. Perform signs for 3-30 seconds to capture sufficient temporal data. The system uses a decoupled UI counter to ensure every landmark frame is recorded with 100% precision.
@@ -72,7 +72,7 @@ This script automatically exports optimized JSON weights for the mobile inferenc
 
 ---
 
-## 📦 Getting Started
+##  Getting Started
 
 1. **Install dependencies**
    ```bash
